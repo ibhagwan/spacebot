@@ -40,6 +40,12 @@ export function useEventSource(url: string, options: UseEventSourceOptions) {
 	const reconnectTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const eventSourceRef = useRef<EventSource | null>(null);
 	const retryDelayRef = useRef(INITIAL_RETRY_MS);
+	// Tracks whether the current reconnect attempt was triggered by an actual
+	// connection error (as opposed to a visibility-change reconnect). This is
+	// separate from retryDelayRef because the visibility handler resets the
+	// backoff delay when the app returns to the foreground, but we still need
+	// to know whether a prior error occurred so onReconnect can re-sync data.
+	const pendingErrorReconnectRef = useRef(false);
 
 	const connect = useCallback(() => {
 		if (eventSourceRef.current) {
@@ -52,11 +58,24 @@ export function useEventSource(url: string, options: UseEventSourceOptions) {
 		eventSourceRef.current = source;
 
 		source.onopen = () => {
-			const wasErrorReconnect = retryDelayRef.current !== INITIAL_RETRY_MS;
+			// Ignore open events from connections we've already replaced or
+			// closed (e.g. via the visibility handler or a newer reconnect
+			// attempt). Only the currently active source may update state.
+			if (eventSourceRef.current !== source) {
+				return;
+			}
+
+			// pendingErrorReconnectRef is set in onerror and cleared here after
+			// onopen handles it. We use a dedicated flag (instead of checking
+			// retryDelayRef) because the visibility handler resets the backoff
+			// delay when the app returns to the foreground, and we must still
+			// re-sync data if the reconnect is recovering from a prior error.
+			const shouldResync = pendingErrorReconnectRef.current;
+			pendingErrorReconnectRef.current = false;
 			retryDelayRef.current = INITIAL_RETRY_MS;
 			setConnectionState("connected");
 
-			if (wasErrorReconnect) {
+			if (shouldResync) {
 				onReconnectRef.current?.();
 			}
 		};
@@ -93,6 +112,9 @@ export function useEventSource(url: string, options: UseEventSourceOptions) {
 			}
 
 			source.close();
+			// Mark that this reconnect is due to an actual error so onopen can
+			// decide whether to call onReconnect for missed-event re-sync.
+			pendingErrorReconnectRef.current = true;
 			setConnectionState("reconnecting");
 
 			const delay = retryDelayRef.current;
